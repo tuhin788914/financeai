@@ -1,22 +1,19 @@
 import os
+import requests as http_requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from model import predict_loan
 
 app = Flask(__name__)
-
 CORS(app)  # Allow all origins — fine for a portfolio/demo project
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "CreditWise ML API v2"})
+# ── Groq Config ───────────────────────────────────────────────────────────────
+# FIX: Read env var here, at module level, so gunicorn picks it up correctly
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama3-8b-8192"
 
-
-# ── Stock data ────────────────────────────────────────────────────────────────
-# Static holdings per sector — mirrors the HD object in index.html.
-# Swap these out for a real market-data API call (e.g. yfinance, Alpha Vantage)
-# whenever you want genuine live prices.
-
+# ── Static holdings per sector ────────────────────────────────────────────────
 HD = {
     "balanced": [
         {"t": "SPY",   "n": "SPDR S&P 500 ETF",       "p": 562.84, "ch": 0.42,  "lo": 430,  "hi": 580,  "pe": 22.4, "sg": "BUY",  "c": "#2563eb", "w": 20},
@@ -72,6 +69,36 @@ HD = {
     ],
 }
 
+
+# ── Groq Helper ───────────────────────────────────────────────────────────────
+
+def _groq(prompt: str, system: str = "") -> str:
+    # FIX: Re-read from env at call time so Railway hot-reloads are respected
+    api_key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY)
+    if not api_key:
+        return "GROQ_API_KEY not configured. Add it in Railway → Variables tab."
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    resp = http_requests.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": GROQ_MODEL, "max_tokens": 800, "messages": messages},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def health():
+    groq_status = "configured" if os.environ.get("GROQ_API_KEY") else "MISSING — add to Railway Variables"
+    return jsonify({"status": "ok", "service": "CreditWise ML API v2", "groq": groq_status})
+
+
 @app.route("/api/stocks", methods=["GET"])
 def stocks():
     sector = request.args.get("sector", "balanced").lower()
@@ -83,47 +110,17 @@ def stocks():
 def loan_predict():
     try:
         data = request.get_json(force=True)
-
         required = ["name", "age", "gender", "married", "dependents",
                     "education", "income", "loanamt", "term",
                     "credit_score", "employment_status", "employer_category",
                     "area", "type"]
-
         missing = [f for f in required if f not in data or str(data[f]).strip() == ""]
         if missing:
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
-
         result = predict_loan(data)
         return jsonify(result)
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
-import requests as http_requests
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama3-8b-8192"
-
-def _groq(prompt: str, system: str = "") -> str:
-    if not GROQ_API_KEY:
-        return "GROQ_API_KEY not configured on the server."
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    resp = http_requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={"model": GROQ_MODEL, "max_tokens": 800, "messages": messages},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 @app.route("/api/analysis", methods=["POST"])
@@ -133,10 +130,10 @@ def portfolio_analysis():
         sector  = body.get("sector", "balanced")
         horizon = body.get("horizon", "medium")
         amount  = body.get("amount", 10000)
-        stocks  = HD.get(sector, HD["balanced"])
+        stocks_data = HD.get(sector, HD["balanced"])
         holdings_text = "\n".join(
             f"  - {s['t']} ({s['n']}): ${s['p']} | P/E {s['pe']} | Signal {s['sg']} | Weight {s['w']}%"
-            for s in stocks
+            for s in stocks_data
         )
         prompt = (
             f"Portfolio: {sector} sector, {horizon} horizon, ${amount:,} invested.\n"
@@ -159,10 +156,10 @@ def screen_stocks():
     try:
         body   = request.get_json(force=True)
         sector = body.get("sector", "balanced")
-        stocks = HD.get(sector, HD["balanced"])
+        stocks_data = HD.get(sector, HD["balanced"])
         holdings_text = "\n".join(
             f"  - {s['t']} ({s['n']}): ${s['p']} | P/E {s['pe']} | Signal {s['sg']}"
-            for s in stocks
+            for s in stocks_data
         )
         prompt = (
             f"Screen these {sector} portfolio stocks and rank the top 3 buys:\n"
@@ -175,3 +172,9 @@ def screen_stocks():
         return jsonify({"screen": text, "sector": sector})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── Entry point (local dev only — gunicorn does NOT use this) ─────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
